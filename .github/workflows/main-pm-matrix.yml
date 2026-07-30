@@ -21,7 +21,7 @@ on:
         type: boolean
 
 env:
-  MUSL_CROSS_MAKE_VERSION: 43fcb1e63786b96add78f89d7454709ae0159fa0
+  MUSL_CROSS_MAKE_VERSION: b7b27ee2f37b5794658dce8a611f91feb456bf91
 
 jobs:
   android:
@@ -55,7 +55,7 @@ jobs:
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
-          repository: pmmp/musl-cross-make
+          repository: axolotl-pm/musl-cross-make
           path: musl-cross-make
           ref: ${{ env.MUSL_CROSS_MAKE_VERSION }}
 
