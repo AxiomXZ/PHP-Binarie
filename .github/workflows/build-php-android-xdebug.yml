@@ -105,6 +105,36 @@ jobs:
           # Fail loudly if the patch didn't actually take effect
           grep -q 'Xdebug on a static build is experimental/debug-only' compile.sh
 
+      # The Xdebug build step in compile.sh never forwards $CONFIGURE_FLAGS
+      # (which carries --host=aarch64-linux-musl on this cross-compile
+      # target) to Xdebug's own ./configure. Every other bundled library in
+      # the script does pass this. Without it, autoconf tries to run a
+      # target-arch test binary on the build host and aborts with
+      # "checking whether we are cross compiling... configure: error: ...".
+      # Patch the Xdebug configure invocation to include $CONFIGURE_FLAGS.
+      - name: Patch compile.sh to pass cross-compile flags to Xdebug configure
+        run: |
+          python3 - <<'EOF'
+          with open('compile.sh') as f:
+              content = f.read()
+
+          old = './configure --with-php-config="$INSTALL_DIR/bin/php-config" >> "$DIR/install.log" 2>&1'
+          new = './configure --with-php-config="$INSTALL_DIR/bin/php-config" $CONFIGURE_FLAGS >> "$DIR/install.log" 2>&1'
+
+          n = content.count(old)
+          if n == 0:
+              raise SystemExit("ERROR: could not find the Xdebug ./configure line to patch - compile.sh has likely changed upstream, update this workflow")
+          if n > 1:
+              raise SystemExit(f"ERROR: expected exactly 1 match for the Xdebug ./configure line, found {n} - update this workflow to disambiguate")
+
+          content = content.replace(old, new)
+          with open('compile.sh', 'w') as f:
+              f.write(content)
+          print("Patched Xdebug ./configure line to include $CONFIGURE_FLAGS")
+          EOF
+          # Fail loudly if the patch didn't actually take effect
+          grep -q 'with-php-config="\$INSTALL_DIR/bin/php-config" \$CONFIGURE_FLAGS' compile.sh
+
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
           export PATH="${{ github.workspace }}/compiler/bin:$PATH"
@@ -156,3 +186,4 @@ jobs:
           path: |
             workspace.tar.gz
           if-no-files-found: error
+          
