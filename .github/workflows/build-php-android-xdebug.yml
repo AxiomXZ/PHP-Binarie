@@ -1,0 +1,158 @@
+name: Build PHP binary (Android, with Xdebug)
+
+on:
+  workflow_call:
+    inputs:
+      pm-version-major:
+        description: 'PocketMine-MP major version'
+        required: true
+        type: number
+      php-version-base:
+        description: 'PHP base version'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      pm-version-major:
+        description: 'PocketMine-MP major version'
+        required: true
+        type: number
+        default: 5
+      php-version-base:
+        description: 'PHP base version'
+        required: true
+        type: string
+        default: '8.3'
+
+env:
+  MUSL_CROSS_MAKE_VERSION: b7b27ee2f37b5794658dce8a611f91feb456bf91
+
+jobs:
+  android-debug:
+    name: Android arm64 (Xdebug build)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tools and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install make autoconf automake libtool libtool-bin m4 wget libc-bin gzip bzip2 bison g++ git re2c
+
+      - name: Prepare compile.sh download cache
+        id: download-cache
+        uses: actions/cache@v6
+        with:
+          path: ./download_cache
+          key: compile-sh-cache-ssl-https-${{ hashFiles('./compile.sh') }}
+          restore-keys: compile-sh-cache-ssl-https-
+
+      - name: Fetch compiler cache
+        id: compiler-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/compiler
+          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
+
+      - name: Checkout musl-cross-make
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: axolotl-pm/musl-cross-make
+          path: musl-cross-make
+          ref: ${{ env.MUSL_CROSS_MAKE_VERSION }}
+
+      - name: Build compiler
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        working-directory: musl-cross-make
+        run: |
+          echo "TARGET = aarch64-linux-musl" > config.mak
+          make -j$(nproc)
+          make install
+          mv ./output "${{ github.workspace }}/compiler"
+
+      # compile.sh unconditionally sets HAVE_XDEBUG=no once DO_STATIC=yes,
+      # since Xdebug is not normally expected to work well in a fully-static
+      # cross-compiled binary. This build is for local debugging only (not
+      # a production release), so we patch that guard out and let the
+      # Xdebug extension build against the static/musl toolchain anyway.
+      - name: Patch compile.sh to allow Xdebug on static builds
+        run: |
+          python3 - <<'EOF'
+          import re
+          with open('compile.sh') as f:
+              content = f.read()
+
+          pattern = re.compile(
+              r'if \[ "\$HAVE_XDEBUG" == "yes" \]; then\n'
+              r'\s*write_out "warning" "Xdebug cannot be built in static mode"\n'
+              r'\s*HAVE_XDEBUG="no"\n'
+              r'\s*fi\n'
+          )
+          new_content, n = pattern.subn(
+              'if [ "$HAVE_XDEBUG" == "yes" ]; then\n'
+              '\t  write_out "warning" "Xdebug on a static build is experimental/debug-only"\n'
+              '\tfi\n',
+              content,
+          )
+          if n == 0:
+              raise SystemExit("ERROR: could not find the Xdebug static-mode guard block to patch - compile.sh has likely changed upstream, update this workflow")
+          with open('compile.sh', 'w') as f:
+              f.write(new_content)
+          print(f"Patched {n} occurrence(s)")
+          EOF
+          # Fail loudly if the patch didn't actually take effect
+          grep -q 'Xdebug on a static build is experimental/debug-only' compile.sh
+
+      - name: Compile PHP with Xdebug (static, Android arm64)
+        run: |
+          export PATH="${{ github.workspace }}/compiler/bin:$PATH"
+          set -ex
+          trap "exit 1" ERR
+          ./compile.sh -t android-aarch64 -x -j "$(nproc)" -P ${{ inputs.pm-version-major }} -c ./download_cache -z ${{ inputs.php-version-base }}
+
+      - name: Enable Xdebug in generated php.ini
+        run: |
+          set -ex
+          INI="bin/php7/bin/php.ini"
+          test -f "$INI"
+          # flip the commented-out xdebug lines on, default to a safe mode
+          sed -i 's/^;zend_extension=xdebug.so/zend_extension=xdebug.so/' "$INI"
+          sed -i 's/^xdebug.mode=off/xdebug.mode=develop,profile/' "$INI"
+          echo "xdebug.output_dir=/data/data/com.termux/files/home/xdebug-out" >> "$INI"
+          grep -q '^zend_extension=xdebug.so' "$INI"
+          cat "$INI"
+
+      - name: Verify xdebug.so was actually built
+        run: |
+          find bin/php7 -iname 'xdebug.so' -print
+          test -n "$(find bin/php7 -iname 'xdebug.so')"
+
+      - name: Create tarball
+        run: |
+          tar -czf ./PHP-${{ inputs.php-version-base }}-Android-arm64-PM${{ inputs.pm-version-major }}-xdebug.tar.gz bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: PHP-${{ inputs.php-version-base }}-Android-PM${{ inputs.pm-version-major }}-xdebug
+          path: |
+            ./*PHP-${{ inputs.php-version-base }}-Android-arm64-PM${{ inputs.pm-version-major }}-xdebug*.tar.gz
+            install.log
+            compile.sh
+          if-no-files-found: error
+
+      - name: Prepare workspace for upload
+        if: failure()
+        run: tar -czf workspace.tar.gz install_data
+
+      - name: Upload workspace
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: PHP-${{ inputs.php-version-base }}-Android-workspace-PM${{ inputs.pm-version-major }}-xdebug
+          path: |
+            workspace.tar.gz
+          if-no-files-found: error
