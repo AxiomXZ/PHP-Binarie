@@ -50,7 +50,7 @@ jobs:
 
       - name: Fetch compiler cache
         id: compiler-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/compiler
           key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
@@ -64,6 +64,7 @@ jobs:
           ref: ${{ env.MUSL_CROSS_MAKE_VERSION }}
 
       - name: Build compiler
+        id: build-compiler
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         working-directory: musl-cross-make
         run: |
@@ -71,6 +72,23 @@ jobs:
           make -j$(nproc)
           make install
           mv ./output "${{ github.workspace }}/compiler"
+
+      # actions/cache@v6's implicit post-job save can be skipped in some
+      # circumstances (e.g. depending on how later steps in this job fail).
+      # Since this compiler build takes a long time and doesn't depend on
+      # anything that changes later in the job (patches, PHP/Xdebug compile),
+      # save it explicitly right here, right after it's built, rather than
+      # relying on an implicit end-of-job save that may not fire if a later
+      # step fails. Guarded on the build step's own success (not just
+      # `always()`) so a broken/partial compiler build never gets saved
+      # under this key - that would poison the cache for every future run
+      # until the version string is bumped.
+      - name: Save compiler cache
+        if: steps.compiler-cache.outputs.cache-hit != 'true' && steps.build-compiler.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/compiler
+          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
 
       # compile.sh unconditionally sets HAVE_XDEBUG=no once DO_STATIC=yes,
       # since Xdebug is not normally expected to work well in a fully-static
