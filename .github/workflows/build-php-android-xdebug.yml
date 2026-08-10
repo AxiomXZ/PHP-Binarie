@@ -111,15 +111,23 @@ jobs:
       # the script does pass this. Without it, autoconf tries to run a
       # target-arch test binary on the build host and aborts with
       # "checking whether we are cross compiling... configure: error: ...".
-      # Patch the Xdebug configure invocation to include $CONFIGURE_FLAGS.
-      - name: Patch compile.sh to pass cross-compile flags to Xdebug configure
+      #
+      # Separately: this toolchain (musl-cross-make) only ships a static
+      # libgcc.a, no libgcc_s.so. Xdebug's libtool-generated link rules
+      # default to linking `-lgcc_s` and fail with "cannot find -lgcc_s"
+      # unless -static-libgcc is known to libtool *at configure time* - it
+      # is baked into libtool's generated link command and is NOT reliably
+      # picked up by setting CFLAGS/LDFLAGS on the later `make` invocation.
+      # So both fixes are applied together, on the ./configure line, via
+      # environment variables that libtool's configure probe will capture.
+      - name: Patch compile.sh to fix Xdebug cross-compile configure (host + static-libgcc)
         run: |
           python3 - <<'EOF'
           with open('compile.sh') as f:
               content = f.read()
 
           old = './configure --with-php-config="$INSTALL_DIR/bin/php-config" >> "$DIR/install.log" 2>&1'
-          new = './configure --with-php-config="$INSTALL_DIR/bin/php-config" $CONFIGURE_FLAGS >> "$DIR/install.log" 2>&1'
+          new = 'CFLAGS="$CFLAGS -static-libgcc" LDFLAGS="$LDFLAGS -static-libgcc" ./configure --with-php-config="$INSTALL_DIR/bin/php-config" $CONFIGURE_FLAGS >> "$DIR/install.log" 2>&1'
 
           n = content.count(old)
           if n == 0:
@@ -130,42 +138,11 @@ jobs:
           content = content.replace(old, new)
           with open('compile.sh', 'w') as f:
               f.write(content)
-          print("Patched Xdebug ./configure line to include $CONFIGURE_FLAGS")
+          print("Patched Xdebug ./configure line to include $CONFIGURE_FLAGS and -static-libgcc")
           EOF
           # Fail loudly if the patch didn't actually take effect
           grep -q 'with-php-config="\$INSTALL_DIR/bin/php-config" \$CONFIGURE_FLAGS' compile.sh
-
-      # Xdebug's own libtool-generated link step doesn't know this toolchain
-      # is fully static (musl-cross-make here only ships a static libgcc.a,
-      # no libgcc_s.so). Without -static-libgcc, its link command defaults to
-      # `-lgcc_s` and fails with:
-      #   ld: cannot find -lgcc_s: No such file or directory
-      #   ld: have you installed the static version of the gcc_s library?
-      # PHP's own ./configure already passes -static-libgcc correctly (that's
-      # why the main PHP build succeeds); Xdebug's separate phpize/make flow
-      # does not inherit it. Patch Xdebug's `make` invocation to force it.
-      - name: Patch compile.sh to force -static-libgcc for Xdebug's link step
-        run: |
-          python3 - <<'EOF'
-          with open('compile.sh') as f:
-              content = f.read()
-
-          old = 'make -j4 >> "$DIR/install.log" 2>&1\n\twrite_install\n\tmake install >> "$DIR/install.log" 2>&1\n\techo "" >> "$INSTALL_DIR/bin/php.ini" 2>&1'
-          new = 'LDFLAGS="$LDFLAGS -static-libgcc" CFLAGS="$CFLAGS -static-libgcc" make -j4 >> "$DIR/install.log" 2>&1\n\twrite_install\n\tmake install >> "$DIR/install.log" 2>&1\n\techo "" >> "$INSTALL_DIR/bin/php.ini" 2>&1'
-
-          n = content.count(old)
-          if n == 0:
-              raise SystemExit("ERROR: could not find the Xdebug make/install block to patch - compile.sh has likely changed upstream, update this workflow")
-          if n > 1:
-              raise SystemExit(f"ERROR: expected exactly 1 match for the Xdebug make/install block, found {n} - update this workflow to disambiguate")
-
-          content = content.replace(old, new)
-          with open('compile.sh', 'w') as f:
-              f.write(content)
-          print("Patched Xdebug make invocation to include -static-libgcc")
-          EOF
-          # Fail loudly if the patch didn't actually take effect
-          grep -q 'static-libgcc.*make -j4' compile.sh
+          grep -q 'static-libgcc.*with-php-config' compile.sh
 
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
