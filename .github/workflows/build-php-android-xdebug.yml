@@ -162,6 +162,30 @@ jobs:
           grep -q 'with-php-config="\$INSTALL_DIR/bin/php-config" \$CONFIGURE_FLAGS' compile.sh
           grep -q 'static-libgcc.*with-php-config' compile.sh
 
+      # Confirmed root cause (from an actual failed build's install.log):
+      # libtool's `-shared` link mode for xdebug.so drops -static-libgcc
+      # from the final `gcc -shared ...` command entirely - libtool treats
+      # it as compile-only and strips it during its link-mode translation,
+      # regardless of where it's set (configure-time or make-time). So the
+      # final link always references `-lgcc_s`, which this musl-cross-make
+      # toolchain never built (it only produced a static libgcc.a).
+      #
+      # Fix: give the linker something to find under that name. We create
+      # a linker script named libgcc_s.so in the toolchain's lib directory
+      # that simply pulls in the real static libgcc.a - this is the
+      # standard workaround for musl toolchains missing libgcc_s.so
+      # (used by several other cross-compiled projects hitting this exact
+      # issue). Placed in a directory already on the linker's search path
+      # for this toolchain so no extra -L flag is needed.
+      - name: Work around missing libgcc_s.so in musl-cross-make toolchain
+        run: |
+          set -ex
+          GCC_LIBDIR="$(${{ github.workspace }}/compiler/bin/aarch64-linux-musl-gcc -print-libgcc-file-name | xargs dirname)"
+          test -f "$GCC_LIBDIR/libgcc.a"
+          test ! -e "$GCC_LIBDIR/libgcc_s.so"
+          echo "GROUP ( $GCC_LIBDIR/libgcc.a )" > "$GCC_LIBDIR/libgcc_s.so"
+          cat "$GCC_LIBDIR/libgcc_s.so"
+
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
           export PATH="${{ github.workspace }}/compiler/bin:$PATH"
