@@ -175,51 +175,38 @@ jobs:
       # static libgcc.a - the standard workaround for musl toolchains
       # missing libgcc_s.so.
       #
-      # The actual failing linker is the TARGET-triple binary
-      # (aarch64-linux-musl-ld), which has its own default search paths,
-      # confirmed via `ld --verbose` to include both toolchain-specific
-      # paths (/aarch64-linux-musl/lib, /aarch64-linux-musl/lib64 - the
-      # sysroot, prefixed with the target triple) AND generic host system
-      # paths (/lib, /usr/lib, /lib64, etc.) that happen to exist on the
-      # runner but belong to the HOST's own toolchain, not this cross
-      # target - we don't have permission to write there, and shouldn't
-      # anyway. So we only place the workaround in dirs whose path is
-      # prefixed with the target triple (the toolchain's own sysroot),
-      # plus GCC's internal lib/gcc/<triple>/<version> dir - skipping (not
-      # failing on) anything we can't write to, since only the toolchain's
-      # own dirs are actually relevant here.
+      # Placement attempts so far: `ld --verbose`'s default SEARCH_DIR
+      # paths (e.g. /aarch64-linux-musl/lib) turned out to be baked-in
+      # absolute paths that don't exist on disk at all in this relocated/
+      # portable musl-cross-make build (confirmed: `[ -d /aarch64-linux-musl/lib ]`
+      # is false on the runner) - so placing the file there is a no-op.
+      # GCC's own internal lib/gcc/<triple>/<version> dir does exist and
+      # gets the file placed, but that alone isn't enough either (confirmed
+      # by a run that still failed to find -lgcc_s with only that in place).
+      #
+      # Rather than continuing to guess which directory this specific `ld`
+      # invocation resolves at runtime, we sidestep the search-path problem
+      # entirely: GCC (not ld directly) reads the LIBRARY_PATH environment
+      # variable and automatically forwards it to the linker as extra -L
+      # search dirs on every invocation it makes - including the ones
+      # libtool generates via -shared, since libtool calls the gcc driver,
+      # not ld directly, for the final link. Because it's an environment
+      # variable rather than a command-line flag, libtool can't strip it
+      # out the way it did with -static-libgcc. We set LIBRARY_PATH here
+      # for all subsequent steps in this job so it's in effect for the
+      # entire PHP + Xdebug compile.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
-          TOOLCHAIN_BIN="${{ github.workspace }}/compiler/bin"
-          GCC="$TOOLCHAIN_BIN/aarch64-linux-musl-gcc"
-          LD="$TOOLCHAIN_BIN/aarch64-linux-musl-ld"
-          TARGET_TRIPLE="aarch64-linux-musl"
+          GCC="${{ github.workspace }}/compiler/bin/aarch64-linux-musl-gcc"
 
           GCC_LIBDIR="$("$GCC" -print-libgcc-file-name | xargs dirname)"
           test -f "$GCC_LIBDIR/libgcc.a"
-          LINKER_SCRIPT="GROUP ( $GCC_LIBDIR/libgcc.a )"
+          echo "GROUP ( $GCC_LIBDIR/libgcc.a )" > "$GCC_LIBDIR/libgcc_s.so"
+          test -f "$GCC_LIBDIR/libgcc_s.so"
 
-          # All of ld's default search dirs, then filtered down to only
-          # those under the target triple's own sysroot - never touch
-          # generic host system paths like /lib, /usr/lib, /lib64.
-          ALL_LD_DIRS="$("$LD" --verbose | grep -o 'SEARCH_DIR("=\?[^"]*")' | sed -E 's/SEARCH_DIR\("=?([^"]*)"\)/\1/')"
-          SYSROOT_LD_DIRS="$(echo "$ALL_LD_DIRS" | grep "/$TARGET_TRIPLE/" || true)"
-
-          PLACED=0
-          for dir in "$GCC_LIBDIR" $SYSROOT_LD_DIRS; do
-            if [ -d "$dir" ] && [ -w "$dir" ] && [ ! -e "$dir/libgcc_s.so" ]; then
-              echo "$LINKER_SCRIPT" > "$dir/libgcc_s.so"
-              echo "Placed libgcc_s.so workaround in: $dir"
-              PLACED=1
-            fi
-          done
-
-          if [ "$PLACED" -eq 0 ]; then
-            echo "ERROR: failed to place libgcc_s.so workaround in any toolchain sysroot directory" >&2
-            echo "Candidate dirs were: $GCC_LIBDIR $SYSROOT_LD_DIRS" >&2
-            exit 1
-          fi
+          echo "LIBRARY_PATH=$GCC_LIBDIR" >> "$GITHUB_ENV"
+          echo "Set LIBRARY_PATH=$GCC_LIBDIR for all subsequent steps"
 
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
