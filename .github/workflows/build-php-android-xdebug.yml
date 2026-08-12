@@ -210,31 +210,64 @@ jobs:
       # flag or variable surviving a translation layer - we're rewriting
       # the literal command that runs. The real binary is renamed once;
       # everything in PATH after this step calls the wrapper instead.
+      # Confirmed root cause (from an actual failed build's install.log):
+      # libtool's `-shared` link mode for xdebug.so drops -static-libgcc
+      # from the final `gcc -shared ...` command entirely - libtool treats
+      # it as compile-only and strips it during its link-mode translation,
+      # regardless of where it's set (configure-time or make-time). So the
+      # final link always references `-lgcc_s`, which this musl-cross-make
+      # toolchain never built (it only produced a static libgcc.a).
+      #
+      # Also confirmed NOT to work: -static-libgcc (any layer), LIBRARY_PATH,
+      # and a compiler-binary wrapper injecting -L - none of these flags/
+      # vars survive into the actual failing `gcc -shared ...` command that
+      # libtool executes. Whatever libtool bakes into its own generated
+      # script isn't influenced by any of them.
+      #
+      # What DOES work reliably: making a real file exist under the name
+      # libgcc_s.so, in a directory the target linker ACTUALLY searches by
+      # default (no flag/injection needed at all in that case). The error
+      # message itself tells us exactly which `ld` binary is failing:
+      #   .../compiler/bin/../lib/gcc/aarch64-linux-musl/10.3.0/../../../../aarch64-linux-musl/bin/ld
+      # which normalizes to:
+      #   .../compiler/aarch64-linux-musl/bin/ld
+      # Cross-toolchains conventionally search ../lib relative to their own
+      # bin/ dir (the sysroot layout) - i.e. .../compiler/aarch64-linux-musl/lib
+      # - which, unlike the /aarch64-linux-musl/lib absolute-root path we
+      # tried earlier (confirmed not to exist on the runner), is a real
+      # subdirectory of where this toolchain is actually installed.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
-          TOOLCHAIN_BIN="${{ github.workspace }}/compiler/bin"
-          GCC="$TOOLCHAIN_BIN/aarch64-linux-musl-gcc"
-
+          COMPILER_ROOT="${{ github.workspace }}/compiler"
+          GCC="$COMPILER_ROOT/bin/aarch64-linux-musl-gcc"
+          SYSROOT_LIB="$COMPILER_ROOT/aarch64-linux-musl/lib"
+          SYSROOT_LIB64="$COMPILER_ROOT/aarch64-linux-musl/lib64"
           GCC_LIBDIR="$("$GCC" -print-libgcc-file-name | xargs dirname)"
+
           test -f "$GCC_LIBDIR/libgcc.a"
-          echo "GROUP ( $GCC_LIBDIR/libgcc.a )" > "$GCC_LIBDIR/libgcc_s.so"
-          test -f "$GCC_LIBDIR/libgcc_s.so"
+          LINKER_SCRIPT="GROUP ( $GCC_LIBDIR/libgcc.a )"
 
-          # Rename the real compiler binary out of the way, put a wrapper
-          # in its place that always adds -L$GCC_LIBDIR before delegating.
-          mv "$GCC" "$GCC.real"
-          cat > "$GCC" << WRAPPER
-          #!/bin/sh
-          exec "$GCC.real" -L"$GCC_LIBDIR" "\$@"
-          WRAPPER
-          chmod +x "$GCC"
+          echo "Toolchain root: $COMPILER_ROOT"
+          find "$COMPILER_ROOT/aarch64-linux-musl" -maxdepth 1 -type d 2>&1 || echo "aarch64-linux-musl dir not found under toolchain root"
 
-          # Sanity-check: the wrapper must still work as a normal compiler
-          echo 'int main(void){return 0;}' > /tmp/wrappertest.c
-          "$GCC" /tmp/wrappertest.c -o /tmp/wrappertest
-          test -x /tmp/wrappertest
-          echo "Wrapper installed and verified at $GCC"
+          PLACED=0
+          for dir in "$SYSROOT_LIB" "$SYSROOT_LIB64" "$GCC_LIBDIR"; do
+            if [ -d "$dir" ]; then
+              if [ ! -e "$dir/libgcc_s.so" ]; then
+                echo "$LINKER_SCRIPT" > "$dir/libgcc_s.so"
+              fi
+              echo "libgcc_s.so present in: $dir"
+              PLACED=1
+            else
+              echo "Directory does not exist, skipping: $dir"
+            fi
+          done
+
+          if [ "$PLACED" -eq 0 ]; then
+            echo "ERROR: none of the candidate sysroot directories exist" >&2
+            exit 1
+          fi
 
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
@@ -242,7 +275,6 @@ jobs:
           set -ex
           trap "exit 1" ERR
           ./compile.sh -t android-aarch64 -x -j "$(nproc)" -P ${{ inputs.pm-version-major }} -c ./download_cache -z ${{ inputs.php-version-base }}
-
       - name: Enable Xdebug in generated php.ini
         run: |
           set -ex
