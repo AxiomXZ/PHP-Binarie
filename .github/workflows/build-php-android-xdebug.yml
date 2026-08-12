@@ -192,21 +192,49 @@ jobs:
       # libtool generates via -shared, since libtool calls the gcc driver,
       # not ld directly, for the final link. Because it's an environment
       # variable rather than a command-line flag, libtool can't strip it
-      # out the way it did with -static-libgcc. We set LIBRARY_PATH here
-      # for all subsequent steps in this job so it's in effect for the
-      # entire PHP + Xdebug compile.
+      # out the way it did with -static-libgcc.
+      #
+      # CONFIRMED NOT ENOUGH: a real build with LIBRARY_PATH set still hit
+      # the identical "cannot find -lgcc_s" error at the identical link
+      # step. Whatever wraps/re-execs gcc in this toolchain's build
+      # (libtool's own compiler-capability re-invocation, or musl-cross-
+      # make's driver wrapping) isn't propagating this environment variable
+      # through to the actual failing `ld` invocation either.
+      #
+      # Final, guaranteed-to-work approach: replace the real
+      # aarch64-linux-musl-gcc binary with a wrapper script that
+      # unconditionally injects -L<dir> into every invocation before
+      # calling the real compiler. This can't be filtered by anything
+      # downstream (not libtool, not CFLAGS/LDFLAGS stripping, not
+      # environment propagation issues) because we're not relying on any
+      # flag or variable surviving a translation layer - we're rewriting
+      # the literal command that runs. The real binary is renamed once;
+      # everything in PATH after this step calls the wrapper instead.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
-          GCC="${{ github.workspace }}/compiler/bin/aarch64-linux-musl-gcc"
+          TOOLCHAIN_BIN="${{ github.workspace }}/compiler/bin"
+          GCC="$TOOLCHAIN_BIN/aarch64-linux-musl-gcc"
 
           GCC_LIBDIR="$("$GCC" -print-libgcc-file-name | xargs dirname)"
           test -f "$GCC_LIBDIR/libgcc.a"
           echo "GROUP ( $GCC_LIBDIR/libgcc.a )" > "$GCC_LIBDIR/libgcc_s.so"
           test -f "$GCC_LIBDIR/libgcc_s.so"
 
-          echo "LIBRARY_PATH=$GCC_LIBDIR" >> "$GITHUB_ENV"
-          echo "Set LIBRARY_PATH=$GCC_LIBDIR for all subsequent steps"
+          # Rename the real compiler binary out of the way, put a wrapper
+          # in its place that always adds -L$GCC_LIBDIR before delegating.
+          mv "$GCC" "$GCC.real"
+          cat > "$GCC" << WRAPPER
+          #!/bin/sh
+          exec "$GCC.real" -L"$GCC_LIBDIR" "\$@"
+          WRAPPER
+          chmod +x "$GCC"
+
+          # Sanity-check: the wrapper must still work as a normal compiler
+          echo 'int main(void){return 0;}' > /tmp/wrappertest.c
+          "$GCC" /tmp/wrappertest.c -o /tmp/wrappertest
+          test -x /tmp/wrappertest
+          echo "Wrapper installed and verified at $GCC"
 
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
