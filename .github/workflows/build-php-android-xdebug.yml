@@ -239,11 +239,24 @@ jobs:
       # search path is NOT ../lib relative to its own bin/ dir, despite that
       # being the usual cross-toolchain convention.
       #
-      # Stop guessing conventions - ask the real ld binary directly what its
-      # default search dirs are (ld --verbose reports these as SEARCH_DIR
-      # entries), resolve each to an absolute path relative to where ld
-      # itself lives (not relative to gcc, not assumed from convention), and
-      # place the file in every one that actually exists on disk.
+      # ld --verbose's output (captured from a real run) shows this linker's
+      # default SEARCH_DIR entries are ALL absolute root-level paths -
+      # /aarch64-linux-musl/lib64, /usr/local/lib64, /lib64, /usr/lib64,
+      # /aarch64-linux-musl/lib, /usr/local/lib, /lib, /usr/lib - hardcoded
+      # at the time this toolchain was originally built, not resolved
+      # relative to wherever it's actually installed now. Since the
+      # toolchain lives under .../compiler/ on this runner rather than at
+      # the filesystem root, none of ld's real default search dirs exist
+      # here at all - which is exactly why every attempt to place the
+      # workaround file under .../compiler/... failed regardless of which
+      # subdirectory we guessed.
+      #
+      # Fix: create the actual /aarch64-linux-musl/lib directory at the
+      # real filesystem root (GitHub-hosted runners give the runner user
+      # passwordless sudo) and place the workaround file there - this is
+      # exactly the path ld itself reports searching, so there's no
+      # remaining layer of indirection, convention-guessing, or flag/env
+      # propagation to fail.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
@@ -256,55 +269,25 @@ jobs:
           test -f "$GCC_LIBDIR/libgcc.a"
           LINKER_SCRIPT="GROUP ( $GCC_LIBDIR/libgcc.a )"
 
-          echo "=== ld --verbose SEARCH_DIR entries (raw) ==="
-          "$LD" --verbose | grep -o 'SEARCH_DIR([^)]*)' || echo "(none found)"
+          echo "=== ld's real default search dirs (ground truth) ==="
+          "$LD" --verbose | grep -o 'SEARCH_DIR([^)]*)'
 
-          echo "=== ld -v ==="
-          "$LD" -v 2>&1 || true
+          # Create the real absolute-root sysroot dir ld actually searches
+          sudo mkdir -p /aarch64-linux-musl/lib
+          echo "$LINKER_SCRIPT" | sudo tee /aarch64-linux-musl/lib/libgcc_s.so > /dev/null
+          test -f /aarch64-linux-musl/lib/libgcc_s.so
+          cat /aarch64-linux-musl/lib/libgcc_s.so
+          echo "Placed libgcc_s.so at the real /aarch64-linux-musl/lib (matches ld's own SEARCH_DIR output)"
 
-          # Extract every SEARCH_DIR path ld itself reports, resolve as an
-          # absolute path (SEARCH_DIR entries can be relative or absolute
-          # depending on how the toolchain was configured).
-          RAW_DIRS="$("$LD" --verbose | grep -o 'SEARCH_DIR("=\?[^"]*")' | sed -E 's/SEARCH_DIR\("=?([^"]*)"\)/\1/')"
-
-          PLACED=0
-          echo "=== Resolving and checking each candidate dir ==="
-          while IFS= read -r dir; do
-            [ -z "$dir" ] && continue
-            # Try as-is (absolute) first
-            if [ -d "$dir" ]; then
-              REAL_DIR="$dir"
-            # Then try relative to ld's own directory
-            elif [ -d "$COMPILER_ROOT/aarch64-linux-musl/bin/$dir" ]; then
-              REAL_DIR="$COMPILER_ROOT/aarch64-linux-musl/bin/$dir"
-            else
-              echo "  SKIP (does not exist as absolute or ld-relative): $dir"
-              continue
-            fi
-            if [ -w "$REAL_DIR" ]; then
-              if [ ! -e "$REAL_DIR/libgcc_s.so" ]; then
-                echo "$LINKER_SCRIPT" > "$REAL_DIR/libgcc_s.so"
-              fi
-              echo "  PLACED in: $REAL_DIR"
-              PLACED=1
-            else
-              echo "  SKIP (not writable): $REAL_DIR"
-            fi
-          done <<< "$RAW_DIRS"
-
-          # Always also cover the two dirs we already know exist, as belt-and-braces
+          # Belt-and-braces: also cover the toolchain-relative dirs from
+          # earlier attempts, in case ld's actual runtime search order
+          # differs subtly from --verbose's reported defaults.
           for dir in "$COMPILER_ROOT/aarch64-linux-musl/lib" "$GCC_LIBDIR"; do
             if [ -d "$dir" ] && [ -w "$dir" ] && [ ! -e "$dir/libgcc_s.so" ]; then
               echo "$LINKER_SCRIPT" > "$dir/libgcc_s.so"
-              echo "  PLACED (fallback) in: $dir"
-              PLACED=1
+              echo "Also placed (fallback) in: $dir"
             fi
           done
-
-          if [ "$PLACED" -eq 0 ]; then
-            echo "ERROR: could not place libgcc_s.so in any resolved directory" >&2
-            exit 1
-          fi
 
       - name: Compile PHP with Xdebug (static, Android arm64)
         run: |
