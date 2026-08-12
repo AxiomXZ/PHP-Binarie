@@ -76,13 +76,10 @@ jobs:
       # actions/cache@v6's implicit post-job save can be skipped in some
       # circumstances (e.g. depending on how later steps in this job fail).
       # Since this compiler build takes a long time and doesn't depend on
-      # anything that changes later in the job (patches, PHP/Xdebug compile),
-      # save it explicitly right here, right after it's built, rather than
-      # relying on an implicit end-of-job save that may not fire if a later
-      # step fails. Guarded on the build step's own success (not just
-      # `always()`) so a broken/partial compiler build never gets saved
-      # under this key - that would poison the cache for every future run
-      # until the version string is bumped.
+      # anything that changes later in the job, save it explicitly right
+      # here, right after it's built. Guarded on the build step's own
+      # success (not just `always()`) so a broken/partial compiler build
+      # never gets saved under this key.
       - name: Save compiler cache
         if: steps.compiler-cache.outputs.cache-hit != 'true' && steps.build-compiler.outcome == 'success'
         uses: actions/cache/save@v6
@@ -90,173 +87,26 @@ jobs:
           path: ${{ github.workspace }}/compiler
           key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
 
-      # compile.sh unconditionally sets HAVE_XDEBUG=no once DO_STATIC=yes,
-      # since Xdebug is not normally expected to work well in a fully-static
-      # cross-compiled binary. This build is for local debugging only (not
-      # a production release), so we patch that guard out and let the
-      # Xdebug extension build against the static/musl toolchain anyway.
-      - name: Patch compile.sh to allow Xdebug on static builds
-        run: |
-          python3 - <<'EOF'
-          import re
-          with open('compile.sh') as f:
-              content = f.read()
-
-          pattern = re.compile(
-              r'if \[ "\$HAVE_XDEBUG" == "yes" \]; then\n'
-              r'\s*write_out "warning" "Xdebug cannot be built in static mode"\n'
-              r'\s*HAVE_XDEBUG="no"\n'
-              r'\s*fi\n'
-          )
-          new_content, n = pattern.subn(
-              'if [ "$HAVE_XDEBUG" == "yes" ]; then\n'
-              '\t  write_out "warning" "Xdebug on a static build is experimental/debug-only"\n'
-              '\tfi\n',
-              content,
-          )
-          if n == 0:
-              raise SystemExit("ERROR: could not find the Xdebug static-mode guard block to patch - compile.sh has likely changed upstream, update this workflow")
-          with open('compile.sh', 'w') as f:
-              f.write(new_content)
-          print(f"Patched {n} occurrence(s)")
-          EOF
-          # Fail loudly if the patch didn't actually take effect
-          grep -q 'Xdebug on a static build is experimental/debug-only' compile.sh
-
-      # The Xdebug build step in compile.sh never forwards $CONFIGURE_FLAGS
-      # (which carries --host=aarch64-linux-musl on this cross-compile
-      # target) to Xdebug's own ./configure. Every other bundled library in
-      # the script does pass this. Without it, autoconf tries to run a
-      # target-arch test binary on the build host and aborts with
-      # "checking whether we are cross compiling... configure: error: ...".
+      # compile.sh in this repo already has the Xdebug/static-build fixes
+      # baked in directly (no static-mode HAVE_XDEBUG override, Xdebug's
+      # ./configure includes $CONFIGURE_FLAGS and -static-libgcc). The only
+      # remaining fix that has to happen here rather than in compile.sh
+      # itself is filesystem-level and needs root, so it stays a CI step:
       #
-      # Separately: this toolchain (musl-cross-make) only ships a static
-      # libgcc.a, no libgcc_s.so. Xdebug's libtool-generated link rules
-      # default to linking `-lgcc_s` and fail with "cannot find -lgcc_s"
-      # unless -static-libgcc is known to libtool *at configure time* - it
-      # is baked into libtool's generated link command and is NOT reliably
-      # picked up by setting CFLAGS/LDFLAGS on the later `make` invocation.
-      # So both fixes are applied together, on the ./configure line, via
-      # environment variables that libtool's configure probe will capture.
-      - name: Patch compile.sh to fix Xdebug cross-compile configure (host + static-libgcc)
-        run: |
-          python3 - <<'EOF'
-          with open('compile.sh') as f:
-              content = f.read()
-
-          old = './configure --with-php-config="$INSTALL_DIR/bin/php-config" >> "$DIR/install.log" 2>&1'
-          new = 'CFLAGS="$CFLAGS -static-libgcc" LDFLAGS="$LDFLAGS -static-libgcc" ./configure --with-php-config="$INSTALL_DIR/bin/php-config" $CONFIGURE_FLAGS >> "$DIR/install.log" 2>&1'
-
-          n = content.count(old)
-          if n == 0:
-              raise SystemExit("ERROR: could not find the Xdebug ./configure line to patch - compile.sh has likely changed upstream, update this workflow")
-          if n > 1:
-              raise SystemExit(f"ERROR: expected exactly 1 match for the Xdebug ./configure line, found {n} - update this workflow to disambiguate")
-
-          content = content.replace(old, new)
-          with open('compile.sh', 'w') as f:
-              f.write(content)
-          print("Patched Xdebug ./configure line to include $CONFIGURE_FLAGS and -static-libgcc")
-          EOF
-          # Fail loudly if the patch didn't actually take effect
-          grep -q 'with-php-config="\$INSTALL_DIR/bin/php-config" \$CONFIGURE_FLAGS' compile.sh
-          grep -q 'static-libgcc.*with-php-config' compile.sh
-
-      # Confirmed root cause (from an actual failed build's install.log):
-      # libtool's `-shared` link mode for xdebug.so drops -static-libgcc
-      # from the final `gcc -shared ...` command entirely - libtool treats
-      # it as compile-only and strips it during its link-mode translation,
-      # regardless of where it's set (configure-time or make-time). So the
-      # final link always references `-lgcc_s`, which this musl-cross-make
-      # toolchain never built (it only produced a static libgcc.a).
-      #
-      # Fix: give the linker something to find under that name. We create
-      # a linker script named libgcc_s.so that simply pulls in the real
-      # static libgcc.a - the standard workaround for musl toolchains
-      # missing libgcc_s.so.
-      #
-      # Placement attempts so far: `ld --verbose`'s default SEARCH_DIR
-      # paths (e.g. /aarch64-linux-musl/lib) turned out to be baked-in
-      # absolute paths that don't exist on disk at all in this relocated/
-      # portable musl-cross-make build (confirmed: `[ -d /aarch64-linux-musl/lib ]`
-      # is false on the runner) - so placing the file there is a no-op.
-      # GCC's own internal lib/gcc/<triple>/<version> dir does exist and
-      # gets the file placed, but that alone isn't enough either (confirmed
-      # by a run that still failed to find -lgcc_s with only that in place).
-      #
-      # Rather than continuing to guess which directory this specific `ld`
-      # invocation resolves at runtime, we sidestep the search-path problem
-      # entirely: GCC (not ld directly) reads the LIBRARY_PATH environment
-      # variable and automatically forwards it to the linker as extra -L
-      # search dirs on every invocation it makes - including the ones
-      # libtool generates via -shared, since libtool calls the gcc driver,
-      # not ld directly, for the final link. Because it's an environment
-      # variable rather than a command-line flag, libtool can't strip it
-      # out the way it did with -static-libgcc.
-      #
-      # CONFIRMED NOT ENOUGH: a real build with LIBRARY_PATH set still hit
-      # the identical "cannot find -lgcc_s" error at the identical link
-      # step. Whatever wraps/re-execs gcc in this toolchain's build
-      # (libtool's own compiler-capability re-invocation, or musl-cross-
-      # make's driver wrapping) isn't propagating this environment variable
-      # through to the actual failing `ld` invocation either.
-      #
-      # Final, guaranteed-to-work approach: replace the real
-      # aarch64-linux-musl-gcc binary with a wrapper script that
-      # unconditionally injects -L<dir> into every invocation before
-      # calling the real compiler. This can't be filtered by anything
-      # downstream (not libtool, not CFLAGS/LDFLAGS stripping, not
-      # environment propagation issues) because we're not relying on any
-      # flag or variable surviving a translation layer - we're rewriting
-      # the literal command that runs. The real binary is renamed once;
-      # everything in PATH after this step calls the wrapper instead.
-      # Confirmed root cause (from an actual failed build's install.log):
-      # libtool's `-shared` link mode for xdebug.so drops -static-libgcc
-      # from the final `gcc -shared ...` command entirely - libtool treats
-      # it as compile-only and strips it during its link-mode translation,
-      # regardless of where it's set (configure-time or make-time). So the
-      # final link always references `-lgcc_s`, which this musl-cross-make
-      # toolchain never built (it only produced a static libgcc.a).
-      #
-      # Also confirmed NOT to work: -static-libgcc (any layer), LIBRARY_PATH,
-      # and a compiler-binary wrapper injecting -L - none of these flags/
-      # vars survive into the actual failing `gcc -shared ...` command that
-      # libtool executes. Whatever libtool bakes into its own generated
-      # script isn't influenced by any of them.
-      #
-      # What DOES work reliably: making a real file exist under the name
-      # libgcc_s.so, in a directory the target linker ACTUALLY searches by
-      # default (no flag/injection needed at all in that case). The error
-      # message itself tells us exactly which `ld` binary is failing:
-      #   .../compiler/bin/../lib/gcc/aarch64-linux-musl/10.3.0/../../../../aarch64-linux-musl/bin/ld
-      # which normalizes to:
-      #   .../compiler/aarch64-linux-musl/bin/ld
-      #
-      # CONFIRMED NOT ENOUGH EITHER: placed a real libgcc_s.so directly in
-      # .../compiler/aarch64-linux-musl/lib (verified to exist, verified the
-      # file was created there) and the build still hit the identical error
-      # at the identical line. So this specific `ld` binary's actual default
-      # search path is NOT ../lib relative to its own bin/ dir, despite that
-      # being the usual cross-toolchain convention.
-      #
-      # ld --verbose's output (captured from a real run) shows this linker's
-      # default SEARCH_DIR entries are ALL absolute root-level paths -
-      # /aarch64-linux-musl/lib64, /usr/local/lib64, /lib64, /usr/lib64,
-      # /aarch64-linux-musl/lib, /usr/local/lib, /lib, /usr/lib - hardcoded
-      # at the time this toolchain was originally built, not resolved
-      # relative to wherever it's actually installed now. Since the
-      # toolchain lives under .../compiler/ on this runner rather than at
-      # the filesystem root, none of ld's real default search dirs exist
-      # here at all - which is exactly why every attempt to place the
-      # workaround file under .../compiler/... failed regardless of which
-      # subdirectory we guessed.
-      #
-      # Fix: create the actual /aarch64-linux-musl/lib directory at the
-      # real filesystem root (GitHub-hosted runners give the runner user
-      # passwordless sudo) and place the workaround file there - this is
-      # exactly the path ld itself reports searching, so there's no
-      # remaining layer of indirection, convention-guessing, or flag/env
-      # propagation to fail.
+      # ld --verbose (run against the real toolchain's ld binary) shows its
+      # default SEARCH_DIR entries are all absolute root-level paths -
+      # /aarch64-linux-musl/lib, /lib64, /usr/lib, etc - hardcoded at the
+      # time this toolchain was built, not resolved relative to wherever
+      # it's actually installed. Since the toolchain lives under
+      # .../compiler/ on this runner rather than at the filesystem root,
+      # none of ld's real default search dirs exist here - so this
+      # toolchain can never find a normal libgcc_s.so and Xdebug's -shared
+      # link (linking against -lgcc_s) fails with "cannot find -lgcc_s".
+      # Every attempt to place a workaround file under .../compiler/... was
+      # confirmed not to work; only creating the real /aarch64-linux-musl/lib
+      # at the actual filesystem root (using the runner's passwordless
+      # sudo) and placing it there worked, since that's the literal path
+      # ld itself reports searching.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
@@ -295,17 +145,6 @@ jobs:
           set -ex
           trap "exit 1" ERR
           ./compile.sh -t android-aarch64 -x -j "$(nproc)" -P ${{ inputs.pm-version-major }} -c ./download_cache -z ${{ inputs.php-version-base }}
-      - name: Enable Xdebug in generated php.ini
-        run: |
-          set -ex
-          INI="bin/php7/bin/php.ini"
-          test -f "$INI"
-          # flip the commented-out xdebug lines on, default to a safe mode
-          sed -i 's/^;zend_extension=xdebug.so/zend_extension=xdebug.so/' "$INI"
-          sed -i 's/^xdebug.mode=off/xdebug.mode=develop,profile/' "$INI"
-          echo "xdebug.output_dir=/data/data/com.termux/files/home/xdebug-out" >> "$INI"
-          grep -q '^zend_extension=xdebug.so' "$INI"
-          cat "$INI"
 
       - name: Verify xdebug.so was actually built
         run: |
