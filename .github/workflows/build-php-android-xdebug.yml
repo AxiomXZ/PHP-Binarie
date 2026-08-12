@@ -35,6 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Ensure compile.sh is executable
+        run: chmod +x compile.sh
+
       - name: Install tools and dependencies
         run: |
           sudo apt-get update
