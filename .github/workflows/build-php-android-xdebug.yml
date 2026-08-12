@@ -231,41 +231,78 @@ jobs:
       #   .../compiler/bin/../lib/gcc/aarch64-linux-musl/10.3.0/../../../../aarch64-linux-musl/bin/ld
       # which normalizes to:
       #   .../compiler/aarch64-linux-musl/bin/ld
-      # Cross-toolchains conventionally search ../lib relative to their own
-      # bin/ dir (the sysroot layout) - i.e. .../compiler/aarch64-linux-musl/lib
-      # - which, unlike the /aarch64-linux-musl/lib absolute-root path we
-      # tried earlier (confirmed not to exist on the runner), is a real
-      # subdirectory of where this toolchain is actually installed.
+      #
+      # CONFIRMED NOT ENOUGH EITHER: placed a real libgcc_s.so directly in
+      # .../compiler/aarch64-linux-musl/lib (verified to exist, verified the
+      # file was created there) and the build still hit the identical error
+      # at the identical line. So this specific `ld` binary's actual default
+      # search path is NOT ../lib relative to its own bin/ dir, despite that
+      # being the usual cross-toolchain convention.
+      #
+      # Stop guessing conventions - ask the real ld binary directly what its
+      # default search dirs are (ld --verbose reports these as SEARCH_DIR
+      # entries), resolve each to an absolute path relative to where ld
+      # itself lives (not relative to gcc, not assumed from convention), and
+      # place the file in every one that actually exists on disk.
       - name: Work around missing libgcc_s.so in musl-cross-make toolchain
         run: |
           set -ex
           COMPILER_ROOT="${{ github.workspace }}/compiler"
           GCC="$COMPILER_ROOT/bin/aarch64-linux-musl-gcc"
-          SYSROOT_LIB="$COMPILER_ROOT/aarch64-linux-musl/lib"
-          SYSROOT_LIB64="$COMPILER_ROOT/aarch64-linux-musl/lib64"
-          GCC_LIBDIR="$("$GCC" -print-libgcc-file-name | xargs dirname)"
+          LD="$COMPILER_ROOT/aarch64-linux-musl/bin/ld"
 
+          test -x "$LD"
+          GCC_LIBDIR="$("$GCC" -print-libgcc-file-name | xargs dirname)"
           test -f "$GCC_LIBDIR/libgcc.a"
           LINKER_SCRIPT="GROUP ( $GCC_LIBDIR/libgcc.a )"
 
-          echo "Toolchain root: $COMPILER_ROOT"
-          find "$COMPILER_ROOT/aarch64-linux-musl" -maxdepth 1 -type d 2>&1 || echo "aarch64-linux-musl dir not found under toolchain root"
+          echo "=== ld --verbose SEARCH_DIR entries (raw) ==="
+          "$LD" --verbose | grep -o 'SEARCH_DIR([^)]*)' || echo "(none found)"
+
+          echo "=== ld -v ==="
+          "$LD" -v 2>&1 || true
+
+          # Extract every SEARCH_DIR path ld itself reports, resolve as an
+          # absolute path (SEARCH_DIR entries can be relative or absolute
+          # depending on how the toolchain was configured).
+          RAW_DIRS="$("$LD" --verbose | grep -o 'SEARCH_DIR("=\?[^"]*")' | sed -E 's/SEARCH_DIR\("=?([^"]*)"\)/\1/')"
 
           PLACED=0
-          for dir in "$SYSROOT_LIB" "$SYSROOT_LIB64" "$GCC_LIBDIR"; do
+          echo "=== Resolving and checking each candidate dir ==="
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            # Try as-is (absolute) first
             if [ -d "$dir" ]; then
-              if [ ! -e "$dir/libgcc_s.so" ]; then
-                echo "$LINKER_SCRIPT" > "$dir/libgcc_s.so"
+              REAL_DIR="$dir"
+            # Then try relative to ld's own directory
+            elif [ -d "$COMPILER_ROOT/aarch64-linux-musl/bin/$dir" ]; then
+              REAL_DIR="$COMPILER_ROOT/aarch64-linux-musl/bin/$dir"
+            else
+              echo "  SKIP (does not exist as absolute or ld-relative): $dir"
+              continue
+            fi
+            if [ -w "$REAL_DIR" ]; then
+              if [ ! -e "$REAL_DIR/libgcc_s.so" ]; then
+                echo "$LINKER_SCRIPT" > "$REAL_DIR/libgcc_s.so"
               fi
-              echo "libgcc_s.so present in: $dir"
+              echo "  PLACED in: $REAL_DIR"
               PLACED=1
             else
-              echo "Directory does not exist, skipping: $dir"
+              echo "  SKIP (not writable): $REAL_DIR"
+            fi
+          done <<< "$RAW_DIRS"
+
+          # Always also cover the two dirs we already know exist, as belt-and-braces
+          for dir in "$COMPILER_ROOT/aarch64-linux-musl/lib" "$GCC_LIBDIR"; do
+            if [ -d "$dir" ] && [ -w "$dir" ] && [ ! -e "$dir/libgcc_s.so" ]; then
+              echo "$LINKER_SCRIPT" > "$dir/libgcc_s.so"
+              echo "  PLACED (fallback) in: $dir"
+              PLACED=1
             fi
           done
 
           if [ "$PLACED" -eq 0 ]; then
-            echo "ERROR: none of the candidate sysroot directories exist" >&2
+            echo "ERROR: could not place libgcc_s.so in any resolved directory" >&2
             exit 1
           fi
 
