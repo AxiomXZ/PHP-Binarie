@@ -26,6 +26,11 @@ on:
 
 env:
   MUSL_CROSS_MAKE_VERSION: b7b27ee2f37b5794658dce8a611f91feb456bf91
+  # Bump this whenever config.mak's content changes (e.g. new compiler
+  # flags) - the cache key below is not sensitive to config.mak on its
+  # own, since it's generated inline in the Build compiler step rather
+  # than being a real file in this repo that hashFiles() could see.
+  TOOLCHAIN_CONFIG_VERSION: pic-fix-1
 
 jobs:
   android-debug:
@@ -56,7 +61,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/compiler
-          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
+          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}-${{ env.TOOLCHAIN_CONFIG_VERSION }}
 
       - name: Checkout musl-cross-make
         if: steps.compiler-cache.outputs.cache-hit != 'true'
@@ -66,12 +71,31 @@ jobs:
           path: musl-cross-make
           ref: ${{ env.MUSL_CROSS_MAKE_VERSION }}
 
+      # ROOT CAUSE (confirmed via a manual replay of the real failing link
+      # command, with -Wl,--verbose): once the libgcc_s.so workaround was
+      # in place, the link progressed past -lgcc_s cleanly, then failed on
+      # a DIFFERENT, more fundamental problem:
+      #   libc.a(getenv.o): relocation R_AARCH64_ADR_PREL_PG_HI21 against
+      #   symbol `__environ' ... can not be used when making a shared
+      #   object; recompile with -fPIC
+      # This musl-cross-make toolchain's libc.a was built without -fPIC,
+      # so it can never be linked into any shared object (.so) - not
+      # specific to Xdebug, this would block ANY PHP extension trying to
+      # build as a loadable .so against this toolchain. musl-cross-make's
+      # own config.mak mechanism (confirmed via the project's own mailing
+      # list: https://www.openwall.com/lists/musl/2017/12/21/1) is the
+      # correct place to fix this - MUSL_CONFIG's CFLAGS is passed through
+      # to musl's own ./configure step when building libc.a itself.
+      # (libgcc is -fPIC by default already, per the same source - only
+      # musl's libc needs the explicit flag.)
       - name: Build compiler
         id: build-compiler
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         working-directory: musl-cross-make
         run: |
           echo "TARGET = aarch64-linux-musl" > config.mak
+          echo 'MUSL_CONFIG += CFLAGS="-fPIC"' >> config.mak
+          cat config.mak
           make -j$(nproc)
           make install
           mv ./output "${{ github.workspace }}/compiler"
@@ -88,7 +112,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/compiler
-          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}
+          key: musl-cross-make-${{ env.MUSL_CROSS_MAKE_VERSION }}-${{ env.TOOLCHAIN_CONFIG_VERSION }}
 
       # compile.sh in this repo already has all the Xdebug/static-build
       # fixes baked in directly (no static-mode HAVE_XDEBUG override,
