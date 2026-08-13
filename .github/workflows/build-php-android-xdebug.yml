@@ -99,11 +99,63 @@ jobs:
       # separate CI-side patching or workaround steps needed.
 
       - name: Compile PHP with Xdebug (static, Android arm64)
+        id: compile_php
         run: |
           export PATH="${{ github.workspace }}/compiler/bin:$PATH"
           set -ex
           trap "exit 1" ERR
           ./compile.sh -t android-aarch64 -x -j "$(nproc)" -P ${{ inputs.pm-version-major }} -c ./download_cache -z ${{ inputs.php-version-base }}
+
+      # DIAGNOSTIC ONLY - runs only if the compile step above failed.
+      # Replays the exact failing gcc -shared link command from
+      # install.log by hand, with -Wl,--verbose appended directly on the
+      # command line (not through CFLAGS/LDFLAGS/configure, which we've
+      # already confirmed libtool doesn't reliably forward into the actual
+      # link it executes). This shows ld's real behavior - which linker
+      # script it's using, what search paths it actually consults, why it
+      # still can't find -lgcc_s despite a file existing at the path
+      # standalone `ld --verbose` reported - without relying on any flag
+      # surviving through the normal build machinery.
+      - name: DIAGNOSTIC - replay the failing Xdebug link command with verbose linker output
+        if: failure() && steps.compile_php.outcome == 'failure'
+        run: |
+          set -x
+          XDEBUG_DIR="install_data/subdir/php/ext/xdebug"
+          if [ ! -d "$XDEBUG_DIR" ]; then
+            echo "Xdebug build dir not found at $XDEBUG_DIR - cannot replay, listing what exists instead:"
+            find install_data -maxdepth 4 -iname 'xdebug*' 2>/dev/null || true
+            exit 0
+          fi
+          cd "$XDEBUG_DIR"
+
+          export PATH="${{ github.workspace }}/compiler/bin:$PATH"
+
+          echo "=== Confirming the workaround file's actual state right now ==="
+          ls -la /aarch64-linux-musl/lib/ 2>&1 || echo "/aarch64-linux-musl/lib does not exist at all"
+          cat /aarch64-linux-musl/lib/libgcc_s.so 2>&1 || echo "cannot read /aarch64-linux-musl/lib/libgcc_s.so"
+
+          echo "=== Replaying the real failing link command with -Wl,--verbose ==="
+          aarch64-linux-musl-gcc -shared \
+            .libs/xdebug.o src/base/.libs/base.o src/base/.libs/ctrl_socket.o src/base/.libs/filter.o \
+            src/lib/.libs/usefulstuff.o src/lib/.libs/cmd_parser.o src/lib/.libs/compat.o src/lib/.libs/crc32.o \
+            src/lib/.libs/file.o src/lib/.libs/hash.o src/lib/.libs/headers.o src/lib/.libs/lib.o \
+            src/lib/.libs/llist.o src/lib/.libs/log.o src/lib/.libs/normalize_path.o src/lib/.libs/set.o \
+            src/lib/.libs/str.o src/lib/.libs/timing.o src/lib/.libs/trim.o src/lib/.libs/var.o \
+            src/lib/.libs/var_export_html.o src/lib/.libs/var_export_line.o src/lib/.libs/var_export_text.o \
+            src/lib/.libs/var_export_xml.o src/lib/.libs/xdebug_strndup.o src/lib/.libs/xml.o \
+            src/lib/maps/.libs/maps.o src/lib/maps/.libs/maps_private.o src/lib/maps/.libs/parser.o \
+            src/coverage/.libs/branch_info.o src/coverage/.libs/code_coverage.o src/debugger/.libs/com.o \
+            src/debugger/.libs/debugger.o src/debugger/.libs/handler_dbgp.o src/debugger/.libs/handlers.o \
+            src/debugger/.libs/ip_info.o src/develop/.libs/develop.o src/develop/.libs/monitor.o \
+            src/develop/.libs/php_functions.o src/develop/.libs/stack.o src/develop/.libs/superglobals.o \
+            src/gcstats/.libs/gc_stats.o src/profiler/.libs/profiler.o src/tracing/.libs/trace_computerized.o \
+            src/tracing/.libs/trace_flamegraph.o src/tracing/.libs/trace_html.o src/tracing/.libs/trace_textual.o \
+            src/tracing/.libs/tracing.o \
+            -L"${{ github.workspace }}/bin/php7/lib" -lm -lz \
+            -march=armv8-a -mtune=generic \
+            -Wl,-static -Wl,-rpath -Wl,"${{ github.workspace }}/bin/php7/lib" \
+            -Wl,-soname -Wl,xdebug.so -Wl,--verbose \
+            -o /tmp/xdebug_diag_test.so 2>&1 | tail -150
 
       - name: Verify xdebug.so was actually built
         run: |
